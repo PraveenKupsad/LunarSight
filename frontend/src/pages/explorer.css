@@ -1,0 +1,31 @@
+.explorer {
+  display: grid;
+  grid-template-columns: 1fr 380px;
+  height: calc(100vh - 74px); /* adjust 74px to your navbar height */
+}
+.explorer-map { position: relative; min-height: 0; background: #000; }
+.map-toolbar {
+  position: absolute; z-index: 5; top: 12px; left: 12px;
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
+.map-toolbar button,
+.map-toolbar select {
+  padding: 8px 14px; border-radius: 999px; cursor: pointer; color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2); background: rgba(10, 14, 40, 0.85);
+}
+.map-toolbar button.active { background: #ff9f1c; color: #000; border-color: #ff9f1c; }
+.coord-readout {
+  position: absolute; z-index: 5; bottom: 12px; left: 12px;
+  font-family: monospace; padding: 6px 10px; border-radius: 6px;
+  background: rgba(0, 0, 0, 0.6); color: #3ddc97;
+}
+.panel {
+  padding: 16px; overflow-y: auto; min-height: 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(10, 14, 40, 0.7);
+}
+.cesium-viewer-bottom { display: none; } /* keep a NASA credit line elsewhere on the page */
+
+@media (max-width: 900px) {
+  .explorer { grid-template-columns: 1fr; grid-template-rows: 60vh auto; height: auto; }
+}

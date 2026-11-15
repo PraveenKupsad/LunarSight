@@ -1,0 +1,48 @@
+.sip { font-size: 0.92rem; }
+.sip-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sip-header h3 { margin: 0; }
+.sip-badge {
+  font-size: 0.7rem; letter-spacing: 0.05em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 999px;
+  background: rgba(255, 159, 28, 0.15); color: #ff9f1c; border: 1px solid rgba(255, 159, 28, 0.4);
+}
+.sip-sub { margin: 4px 0 12px; opacity: 0.6; font-size: 0.8rem; font-family: monospace; }
+.sip-empty { opacity: 0.7; }
+
+.sip-section { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
+.sip-section h4 { margin: 0 0 8px; font-size: 0.95rem; }
+.sip-section dl { display: grid; grid-template-columns: 1fr auto; gap: 5px 12px; margin: 0; }
+.sip-section dt { opacity: 0.65; }
+.sip-section dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+
+.sip-score { display: flex; align-items: baseline; gap: 6px; margin-bottom: 6px; }
+.sip-score-num { font-size: 2rem; font-weight: 700; color: #ff9f1c; }
+.sip-score-max { opacity: 0.6; }
+.sip-score-label { margin-left: auto; font-weight: 600; }
+
+.sip-meter { height: 6px; border-radius: 999px; background: rgba(255, 255, 255, 0.1); overflow: hidden; }
+.sip-meter-fill { height: 100%; background: linear-gradient(90deg, #ff9f1c, #ffd166); }
+
+.sip-breakdown { list-style: none; padding: 0; margin: 12px 0; display: grid; gap: 10px; }
+.sip-breakdown li { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; }
+.sip-breakdown li .sip-meter { grid-column: 1 / -1; }
+
+.sip-tags { margin: 6px 0; font-size: 0.85rem; }
+.sip-tags.good { color: #3ddc97; }
+.sip-tags.bad { color: #ff8a8a; }
+.sip-explain { opacity: 0.8; line-height: 1.45; }
+.sip-note { opacity: 0.6; font-size: 0.8rem; }
+
+.sip-error { padding: 10px; border-radius: 8px; background: rgba(255, 90, 90, 0.12); color: #ff8a8a; }
+.sip-error button { margin-left: 8px; }
+
+.sip-actions { display: grid; gap: 8px; margin-top: 8px; }
+.sip-actions button {
+  padding: 10px; border-radius: 8px; border: none; cursor: pointer;
+  background: #ff9f1c; color: #000; font-weight: 600;
+}
+.sip-actions button.secondary {
+  background: transparent; color: #fff; border: 1px solid rgba(255, 255, 255, 0.25);
+}
+.sip-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+.sip-link { text-align: center; color: #ff9f1c; text-decoration: none; padding: 6px; }
