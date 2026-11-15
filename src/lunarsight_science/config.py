@@ -40,6 +40,7 @@ FRAME_VALIDATION_STATUS = "PENDING_KERNELS"
 # 4. Lunar Geodetic Constants
 # IAU standard mean lunar radius (1,737.4 km)
 LUNAR_RADIUS_METRES = 1737400.0
+MOON_MEAN_RADIUS_KM = LUNAR_RADIUS_METRES / 1000.0
 
 # 5. Coordinate Conventions
 # - Latitude: Planetocentric (-90.0 deg at South Pole to +90.0 deg at North Pole)
