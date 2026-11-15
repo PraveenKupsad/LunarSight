@@ -1,375 +1,507 @@
+"""Earth visibility and Direct-to-Earth (DTE) communication geometry.
+
+Calculates geometric Earth elevation, azimuth, distance, angular radius,
+and line-of-sight visibility for coordinates on the lunar surface using
+NASA/JPL SPICE ephemerides in the designated Mean Earth / Polar Axis (MOON_ME) frame.
+
+IMPORTANT SCIENTIFIC ASSUMPTIONS & LIMITATIONS:
+1. Visibility Classification:
+   FULL/PARTIAL/OCCULTED classifies geometric visibility of the Earth disk relative
+   to the mean lunar reference sphere. It DOES NOT account for local terrain
+   obstructions, crater walls, multipath interference, antenna gain, or RF link budget.
+2. Terrain Obstruction:
+   Terrain horizon analysis using DEM data is NOT YET IMPLEMENTED.
+3. Topocentric Observer & Aberration Approximation:
+   Subtracting the landing-site body-fixed vector from the Moon-centre Earth position vector
+   (v_topo = r_earth/moon - r_site/moon) is a geometric parallax approximation. It evaluates
+   stellar aberration and light-time ('LT+S') at the Moon's center of mass rather than
+   providing a fully site-specific, topocentric light-time/aberration solution.
+4. Earth Angular Radius Approximation:
+   The Earth equatorial radius (6,378,137.0 m) is used as a spherical upper-bound
+   approximation. Because of Earth's oblateness (polar radius ~6,356,752 m), the true
+   apparent angular radius varies by up to ~0.33% depending on sub-lunar latitude.
+5. South Pole Azimuth Convention:
+   At the exact pole (latitude = -90.0 deg), physical North is undefined. The code uses
+   MOON_ME +X as the 0 deg azimuth reference and +Y as the 90 deg reference. This is an
+   assumed coordinate convention only: the alignment of +X with the 0 deg Selenographic
+   Meridian or Mean Earth direction has not been physically verified. Verification is
+   pending availability of the relevant frame kernel and validation of its transformation.
+6. Frame Support Limitation:
+   spice.namfrm(LUNAR_REFERENCE_FRAME) only verifies that the frame name string is
+   recognized by SPICE. It DOES NOT validate kernel coverage, kernel data integrity,
+   or the physical accuracy of the frame transformation for the requested time range.
 """
-LunarSight - Simplified Earth Visibility & Communication Link Analysis
-=======================================================================
-Estimates Earth visibility from lunar south pole terrain using local topography
-extracted from the LOLA Digital Elevation Model (DEM).
 
-SCIENTIFIC ASSUMPTIONS & SIMPLIFICATION NOTICE:
------------------------------------------------
-1. Initial Simplified Calculation: This module uses a geometric model of the
-   Moon's mean orientation rather than a dynamic NASA NAIF SPICE kernel integration.
-2. Tidally Locked Geometry: The Moon is assumed to be synchronously locked with
-   its mean sub-Earth point at (0.0° Lat, 0.0° Lon). Optical/physical librations
-   (which oscillate Earth's position by ±6° to ±8°) are set to mean zero for this baseline.
-3. Geometric Horizon & Topography: At latitude -89.9°S, Earth sits near the
-   astronomical horizon (~+0.1° elevation). Whether Earth is visible is strongly
-   dominated by local terrain: elevated crater rims lift Earth above the horizon,
-   while deep crater floors suffer total topographic obstruction.
-4. Read-Only Data: The input DEM file is accessed strictly in read-only mode and is not modified.
-
-Input:  data/raw/lola/MOON_LRO_NAC_DEM_89S210E_4mp.tif
-Output: data/processed/earth_visibility.png
-"""
-
-import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
+import math
 import numpy as np
-import rasterio
 
-# Use headless Agg backend to prevent GUI pop-ups and terminal freezes
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
+try:
+    import spiceypy as spice
+    HAS_SPICEYPY = True
+except ImportError:
+    HAS_SPICEYPY = False
 
-from ..data_collection.spice_manager import DEFAULT_KERNEL_DIR, REQUIRED_KERNELS
+from ..config import (
+    LUNAR_REFERENCE_FRAME,
+    LUNAR_RADIUS_METRES,
+    SPICE_KERNELS_DIR,
+    COORDINATE_SYSTEM,
+    LONGITUDE_CONVENTION,
+    DISTANCE_UNITS,
+    ELEVATION_UNITS,
+)
 
-# Define project paths
-MODULE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = MODULE_DIR.parent.parent.parent
-DEM_PATH = PROJECT_ROOT / "data" / "raw" / "lola" / "MOON_LRO_NAC_DEM_89S210E_4mp.tif"
-OUTPUT_DIR = PROJECT_ROOT / "data" / "processed"
-OUTPUT_IMAGE = OUTPUT_DIR / "earth_visibility.png"
+# Standard nominal Earth equatorial radius in metres (IAU / WGS84 standard: 6,378.137 km)
+# NOTE: Used as a spherical upper-bound approximation for apparent angular radius.
+EARTH_EQUATORIAL_RADIUS_METRES = 6378137.0
 
-# Physical Constants (NASA / IAU standards)
-MOON_RADIUS_M = 1737400.0   # Mean volumetric radius of the Moon in metres
+# Maximum allowed timesteps per calculation request to prevent DoS / memory exhaustion
+MAX_ALLOWED_TIMESTEPS = 8760  # e.g., 1 year at 1-hour resolution
+MAX_SAFE_LONGITUDE_DEG = float(2**53)
+# Keep longitude reduction within the exact-integer range of IEEE-754 doubles.
+# Reject sub-resolution steps to prevent timedelta rounding to zero.
+MIN_STEP_HOURS = timedelta.resolution.total_seconds() / 3600.0
+# Steps cannot exceed the full range representable by Python's datetime values.
+MAX_STEP_HOURS = (datetime.max - datetime.min).total_seconds() / 3600.0
 
 
-def compute_approximate_earth_direction(site_lat_deg: float, site_lon_deg: float) -> tuple[float, float]:
+def _finite_science_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(converted):
+        return None
+    return converted
+
+
+def check_required_kernels(kernel_dir: Path) -> Dict[str, Any]:
+    """Inspects the kernel directory and identifies available and missing SPICE kernels.
+
+    Distinguishes:
+    - LSK: Leapseconds (*.tls)
+    - PCK (Text): Planetary physical constants (*.tpc)
+    - SPK: Planetary Ephemeris (*.bsp)
+    - BPC: Binary Lunar PCK (*.bpc) for high-precision lunar physical libration
+    - FK: Frame Kernel (*.tf) defining frame relationships for MOON_ME
+
+    Note: Frame kernels (*.tf) and binary PCKs (*.bpc) are distinct requirements
+    and neither replaces the other.
     """
-    Computes the approximate geometric direction (Elevation and Azimuth) of Earth
-    from a lunar surface coordinate assuming mean tidal locking (sub-Earth point at 0°N, 0°E).
+    if not kernel_dir.exists() or not kernel_dir.is_dir():
+        return {
+            "all_present": False,
+            "kernel_dir": str(kernel_dir),
+            "found_files": [],
+            "missing_categories": [
+                "LSK (Leapseconds .tls)",
+                "PCK_TEXT (Planetary Constants .tpc)",
+                "SPK (Ephemeris .bsp)",
+                "BPC (Binary Lunar PCK .bpc)",
+                "FK (Frame Kernel .tf)"
+            ]
+        }
+
+    found_files = [p.name for p in kernel_dir.iterdir() if p.is_file()]
+
+    has_lsk = any(f.lower().endswith(".tls") for f in found_files)
+    has_pck = any(f.lower().endswith(".tpc") for f in found_files)
+    has_spk = any(f.lower().endswith(".bsp") for f in found_files)
+    has_bpc = any(f.lower().endswith(".bpc") for f in found_files)
+    has_fk = any(f.lower().endswith(".tf") for f in found_files)
+
+    missing = []
+    if not has_lsk:
+        missing.append("LSK (Leapseconds .tls, e.g., naif0012.tls)")
+    if not has_pck:
+        missing.append("PCK_TEXT (Planetary Constants .tpc, e.g., pck00010.tpc)")
+    if not has_spk:
+        missing.append("SPK (Ephemeris .bsp, e.g., de421.bsp or de440.bsp)")
+    if not has_bpc:
+        missing.append("BPC (Binary Lunar PCK .bpc, e.g., moon_pa_de421_1900-2050.bpc or moon_pa_de440_200625.bpc)")
+    if not has_fk:
+        missing.append("FK (Frame Kernel .tf, e.g., moon_080317.tf)")
+
+    return {
+        "all_present": (len(missing) == 0),
+        "kernel_dir": str(kernel_dir),
+        "found_files": found_files,
+        "missing_categories": missing
+    }
+
+
+def parse_utc_iso_string(timestamp_str: str) -> Optional[datetime]:
+    """Parses an ISO 8601 string and strictly verifies that an explicit UTC timezone is present.
+
+    Rejects naive timestamps and '-00:00' (indeterminate UTC offset).
+    Accepts only explicit, known UTC indicators: 'Z' or '+00:00'.
+    """
+    if not isinstance(timestamp_str, str):
+        return None
+    raw = timestamp_str.strip()
+
+    # Explicitly reject indeterminate UTC offset '-00:00'
+    if raw.endswith("-00:00"):
+        return None
+
+    # Accept only explicit 'Z' or '+00:00'
+    if not (raw.endswith("Z") or raw.endswith("+00:00")):
+        return None
+
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None or dt.utcoffset() != timedelta(0):
+            return None
+        return dt
+    except Exception:
+        return None
+
+
+def classify_earth_disk_visibility(
+    elevation_deg: float,
+    angular_radius_deg: float
+) -> Tuple[str, bool]:
+    """Classifies the geometric visibility of the Earth disk relative to the mean spherical horizon.
+
+    Parameters:
+        elevation_deg: Apparent elevation angle of Earth's center above the spherical horizon in degrees.
+        angular_radius_deg: Apparent angular radius of the Earth disk in degrees.
 
     Returns:
-    - earth_elev_deg: Geometric altitude of Earth center above mean spherical datum
-    - earth_azimuth_deg: Compass bearing to Earth from Lunar North through East
+        Tuple[str, bool]: (classification, is_visible)
+            - ("FULL", True): Earth disk is entirely above the geometric horizon (elev > radius).
+            - ("PARTIAL", True): Earth disk intersects the geometric horizon (-radius <= elev <= radius).
+            - ("OCCULTED", False): Earth disk is entirely below the geometric horizon (elev < -radius).
     """
-    lat_rad = math.radians(site_lat_deg)
-    lon_rad = math.radians(site_lon_deg)
-
-    # Unit vector pointing outward from lunar center to surface site
-    r_site = np.array([
-        math.cos(lat_rad) * math.cos(lon_rad),
-        math.cos(lat_rad) * math.sin(lon_rad),
-        math.sin(lat_rad)
-    ])
-
-    # Mean Earth vector from lunar center (pointing toward 0° Lat, 0° Lon on Nearside)
-    r_earth = np.array([1.0, 0.0, 0.0])
-
-    # Topocentric horizon basis vectors:
-    # Zenith (Up)
-    u_zenith = r_site / np.linalg.norm(r_site)
-
-    # North
-    u_north = np.array([
-        -math.sin(lat_rad) * math.cos(lon_rad),
-        -math.sin(lat_rad) * math.sin(lon_rad),
-        math.cos(lat_rad)
-    ])
-
-    # East (North x Zenith)
-    u_east = np.array([-math.sin(lon_rad), math.cos(lon_rad), 0.0])
-
-    # Topocentric Earth vector
-    r_earth_topo = r_earth
-
-    e_coord = float(np.dot(r_earth_topo, u_east))
-    n_coord = float(np.dot(r_earth_topo, u_north))
-    z_coord = float(np.dot(r_earth_topo, u_zenith))
-
-    # Elevation angle above mean spherical horizon
-    sin_elev = z_coord / np.linalg.norm(r_earth_topo)
-    elev_deg = math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
-
-    # Azimuth angle from North through East
-    azimuth_deg = math.degrees(math.atan2(e_coord, n_coord))
-    if azimuth_deg < 0:
-        azimuth_deg += 360.0
-
-    return elev_deg, azimuth_deg
-
-
-def check_spice_kernels() -> None:
-    """Verifies that all required NASA SPICE kernels are present on disk."""
-    for kernel_name in REQUIRED_KERNELS:
-        kernel_path = DEFAULT_KERNEL_DIR / kernel_name
-        if not kernel_path.exists() or kernel_path.stat().st_size == 0:
-            raise RuntimeError(
-                f"NASA SPICE kernel '{kernel_name}' is missing from {DEFAULT_KERNEL_DIR}.\n"
-                f"Run 'python -m src.lunarsight_science.data_collection.spice_manager' to download it."
-            )
+    if elevation_deg > angular_radius_deg:
+        return "FULL", True
+    elif elevation_deg >= -angular_radius_deg:
+        return "PARTIAL", True
+    else:
+        return "OCCULTED", False
 
 
 def calculate_earth_visibility(
-    dem_path: Path = DEM_PATH,
-    output_path: Path = OUTPUT_IMAGE,
-    site_lat: float = -89.9,
-    site_lon: float = 0.0,
-    utc_time_str: str | None = None,
-    save_image: bool = True
-) -> dict[str, Any]:
-    """
-    Reads the DEM using Rasterio, calculates Earth direction using dynamic NASA SPICE ephemeris
-    by default (including real lunar orbital librations), evaluates terrain obstruction, and saves the visibility map.
+    latitude_deg: float,
+    longitude_deg: float,
+    start_time_utc: str,
+    end_time_utc: str,
+    step_hours: float = 1.0,
+    use_terrain_horizon: bool = False
+) -> Dict[str, Any]:
+    """Calculates geometric Earth position and Direct-to-Earth (DTE) visibility status.
+
+    Coordinates and Units:
+    - latitude_deg: Planetocentric latitude (-90.0 at South Pole to +90.0 at North Pole).
+    - longitude_deg: East-positive longitude (0.0 to 360.0 degrees).
+    - elevation / distances: Metres.
+    - Reference frame: MOON_ME (Mean Earth / Polar Axis).
+
+    Scientific & Horizon Clarifications:
+    - Visibility states (FULL, PARTIAL, OCCULTED) represent the geometric visibility of the
+      Earth disk relative to the local horizontal tangent plane on the mean lunar sphere.
+      They DO NOT account for local terrain masking, crater rims, or RF propagation effects.
+    - Terrain horizon masking is marked NOT_IMPLEMENTED; no terrain-corrected visibility
+      is computed or claimed.
+    - If required SPICE kernels are unavailable, returns status="MISSING_KERNELS".
 
     Returns:
-    - dict with earth_elevation_deg, earth_azimuth_deg, rim_status, floor_status, pct_visible, output_image_path.
+        Dict[str, Any]: Structured calculation results matching the scientific interface.
     """
-    # 1. Earth Direction: Default to dynamic NASA SPICE ephemeris
-    if utc_time_str != "SIMULATED":
-        # Check required SPICE kernels are present; fail clearly if missing
-        check_spice_kernels()
+    # 1. Strict Input Validation (Reject NaN, Inf, Out-of-bounds)
+    latitude_value = _finite_science_number(latitude_deg)
+    if latitude_value is None:
+        return {
+            "status": "INVALID_INPUT",
+            "error": "Latitude must be a valid, finite real number.",
+            "data": None
+        }
 
-        # If no UTC time is provided, default to current UTC time
-        if utc_time_str is None:
-            utc_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    if not (-90.0 <= latitude_value <= 90.0):
+        return {
+            "status": "INVALID_INPUT",
+            "error": f"Latitude {latitude_deg} is out of bounds. Must be between -90.0 and +90.0 degrees ({COORDINATE_SYSTEM}).",
+            "data": None
+        }
 
-        spice_res = compute_earth_position(utc_time_str, site_lat, site_lon)
-        earth_elev_datum = spice_res["earth_elevation_deg"]
-        earth_azimuth = spice_res["earth_azimuth_deg"]
-        method_desc = f"NASA_SPICE_DYNAMIC ({utc_time_str})"
+    longitude_value = _finite_science_number(longitude_deg)
+    if longitude_value is None:
+        return {
+            "status": "INVALID_INPUT",
+            "error": "Longitude must be a valid, finite real number.",
+            "data": None
+        }
+
+    if abs(longitude_deg) > MAX_SAFE_LONGITUDE_DEG:
+        return {
+            "status": "INVALID_INPUT",
+            "error": (
+                "Longitude magnitude exceeds the safe range for degree "
+                "normalization."
+            ),
+            "data": None
+        }
+
+    step_hours_value = _finite_science_number(step_hours)
+    if step_hours_value is None or step_hours_value <= 0.0:
+        return {
+            "status": "INVALID_INPUT",
+            "error": "step_hours must be a finite positive number.",
+            "data": None
+        }
+    if step_hours_value < MIN_STEP_HOURS:
+        return {
+            "status": "INVALID_INPUT",
+            "error": (
+                "step_hours must be at least one microsecond to advance "
+                "the UTC timeline safely."
+            ),
+            "data": None
+        }
+    if step_hours_value > MAX_STEP_HOURS:
+        return {
+            "status": "INVALID_INPUT",
+            "error": "step_hours exceeds the supported datetime range.",
+            "data": None
+        }
+
+    norm_lon_deg = longitude_value % 360.0
+
+    # 2. Validate UTC Timestamps (Rejects naive and '-00:00' timestamps)
+    t_start = parse_utc_iso_string(start_time_utc)
+    if t_start is None:
+        return {
+            "status": "INVALID_INPUT",
+            "error": f"start_time_utc '{start_time_utc}' is invalid. Must be an ISO 8601 string with an explicit known UTC timezone ('Z' or '+00:00').",
+            "data": None
+        }
+
+    t_end = parse_utc_iso_string(end_time_utc)
+    if t_end is None:
+        return {
+            "status": "INVALID_INPUT",
+            "error": f"end_time_utc '{end_time_utc}' is invalid. Must be an ISO 8601 string with an explicit known UTC timezone ('Z' or '+00:00').",
+            "data": None
+        }
+
+    if t_end < t_start:
+        return {
+            "status": "INVALID_INPUT",
+            "error": "end_time_utc cannot be earlier than start_time_utc.",
+            "data": None
+        }
+
+    delta_step = timedelta(hours=step_hours_value)
+    duration = t_end - t_start
+    duration_microseconds = (
+        (duration.days * 86400 + duration.seconds) * 1_000_000
+        + duration.microseconds
+    )
+    step_microseconds = (
+        (delta_step.days * 86400 + delta_step.seconds) * 1_000_000
+        + delta_step.microseconds
+    )
+    estimated_steps = duration_microseconds // step_microseconds + 1
+    if estimated_steps > MAX_ALLOWED_TIMESTEPS:
+        return {
+            "status": "INVALID_INPUT",
+            "error": f"Requested duration results in {estimated_steps} timesteps, exceeding the safety limit of {MAX_ALLOWED_TIMESTEPS}. Increase step_hours or reduce the time window.",
+            "data": None
+        }
+
+    # 3. Check SpiceyPy and Kernel Availability
+    if not HAS_SPICEYPY:
+        return {
+            "status": "DEPENDENCY_ERROR",
+            "error": "SpiceyPy library is not available in the current Python environment.",
+            "data": None
+        }
+
+    kernel_check = check_required_kernels(SPICE_KERNELS_DIR)
+    if not kernel_check["all_present"]:
+        return {
+            "status": "MISSING_KERNELS",
+            "error": (
+                f"Required SPICE kernels are not present in '{SPICE_KERNELS_DIR}'. "
+                f"Missing categories: {', '.join(kernel_check['missing_categories'])}. "
+                "High-precision calculations in MOON_ME require complete NAIF kernel coverage "
+                "(LSK, text PCK, ephemeris SPK, binary lunar PCK, and frame kernel)."
+            ),
+            "details": {
+                "kernel_dir": str(SPICE_KERNELS_DIR),
+                "found_files": kernel_check["found_files"],
+                "missing_categories": kernel_check["missing_categories"]
+            },
+            "data": None
+        }
+
+    # 4. Terrain Handling Clarification
+    terrain_analysis_status = "NOT_IMPLEMENTED"
+    terrain_note = (
+        "Terrain horizon obstruction analysis using DEM data is NOT_IMPLEMENTED in this module. "
+        "Reported values represent unmasked geometric Earth-disk elevation relative to the mean lunar sphere."
+    )
+
+    # 5. SPICE Ephemeris Topocentric Calculation
+    loaded_kernels = []
+    timeline: List[Dict[str, Any]] = []
+    calculation_result: Dict[str, Any] | None = None
+
+    try:
+        # Furnish kernels
+        for f in SPICE_KERNELS_DIR.iterdir():
+            if f.is_file() and f.suffix.lower() in [".tls", ".tpc", ".bsp", ".bpc", ".tf"]:
+                spice.furnsh(str(f))
+                loaded_kernels.append(f.name)
+
+        # Verify that the MOON_ME reference frame is registered in the SPICE frame subsystem.
+        # NOTE: namfrm() verifies name registration only; it does not validate kernel epoch coverage.
+        frame_code = spice.namfrm(LUNAR_REFERENCE_FRAME)
+        if frame_code == 0:
+            return {
+                "status": "FRAME_UNSUPPORTED",
+                "error": f"The loaded kernels do not support reference frame '{LUNAR_REFERENCE_FRAME}'. Ensure the appropriate frame kernel and binary PCK are present.",
+                "data": None
+            }
+
+        lat_rad = math.radians(latitude_value)
+        lon_rad = math.radians(norm_lon_deg)
+
+        # Site position in MOON_ME Cartesian coordinates (metres)
+        site_x = LUNAR_RADIUS_METRES * math.cos(lat_rad) * math.cos(lon_rad)
+        site_y = LUNAR_RADIUS_METRES * math.cos(lat_rad) * math.sin(lon_rad)
+        site_z = LUNAR_RADIUS_METRES * math.sin(lat_rad)
+        site_vec_m = np.array([site_x, site_y, site_z], dtype=float)
+
+        zenith_u = np.array([
+            math.cos(lat_rad) * math.cos(lon_rad),
+            math.cos(lat_rad) * math.sin(lon_rad),
+            math.sin(lat_rad)
+        ], dtype=float)
+
+        is_exact_pole = abs(latitude_value) >= 89.9999
+
+        current_t = t_start
+
+        while current_t <= t_end:
+            iso_utc = current_t.strftime("%Y-%m-%dT%H:%M:%SZ")
+            et = spice.str2et(iso_utc)
+
+            # Retrieve Earth position relative to Moon center in MOON_ME (km -> metres)
+            # NOTE: Evaluated using light-time and stellar aberration ('LT+S') at Moon center.
+            # Topocentric parallax is computed geometrically by subtracting site_vec_m.
+            earth_pos_km, _ = spice.spkpos("EARTH", et, LUNAR_REFERENCE_FRAME, "LT+S", "MOON")
+            earth_pos_m = np.array(earth_pos_km, dtype=float) * 1000.0
+
+            # Topocentric vector from landing site to Earth
+            topo_vec_m = earth_pos_m - site_vec_m
+            dist_m = float(np.linalg.norm(topo_vec_m))
+
+            # Earth elevation angle above spherical tangent horizon
+            sin_elev = float(np.dot(topo_vec_m, zenith_u) / dist_m)
+            sin_elev = max(-1.0, min(1.0, sin_elev))
+            elev_deg = math.degrees(math.asin(sin_elev))
+
+            # Azimuth calculation
+            if is_exact_pole:
+                # Assumed output convention pending verification of the MOON_ME frame orientation.
+                u_ref = np.array([1.0, 0.0, 0.0], dtype=float)
+                u_ortho = np.array([0.0, 1.0, 0.0], dtype=float)
+                az_deg = math.degrees(math.atan2(np.dot(topo_vec_m, u_ortho), np.dot(topo_vec_m, u_ref))) % 360.0
+            else:
+                east_u = np.array([-math.sin(lon_rad), math.cos(lon_rad), 0.0], dtype=float)
+                north_u = np.cross(zenith_u, east_u)
+                az_deg = math.degrees(math.atan2(np.dot(topo_vec_m, east_u), np.dot(topo_vec_m, north_u))) % 360.0
+
+            # Earth apparent angular radius (using equatorial radius spherical approximation)
+            sin_ang_rad = min(1.0, EARTH_EQUATORIAL_RADIUS_METRES / dist_m)
+            earth_angular_radius_deg = math.degrees(math.asin(sin_ang_rad))
+
+            # Geometric Earth-disk visibility classification via helper
+            disk_class, is_visible = classify_earth_disk_visibility(elev_deg, earth_angular_radius_deg)
+
+            timeline.append({
+                "timestamp_utc": iso_utc,
+                "earth_elevation_deg": round(elev_deg, 4),
+                "earth_azimuth_deg": round(az_deg, 4),
+                "earth_distance_m": round(dist_m, 2),
+                "earth_angular_radius_deg": round(earth_angular_radius_deg, 4),
+                "geometric_earth_disk_classification": disk_class,
+                "is_earth_visible": is_visible
+            })
+
+            if delta_step > t_end - current_t:
+                break
+            current_t += delta_step
+
+    except Exception as exc:
+        calculation_result = {
+            "status": "CALCULATION_ERROR",
+            "error": f"SPICE calculation error: {str(exc)}",
+            "data": None
+        }
+    finally:
+        try:
+            spice.kclear()
+        except Exception:
+            if calculation_result is None:
+                calculation_result = {
+                    "status": "CALCULATION_ERROR",
+                    "error": "SPICE kernel cleanup failed.",
+                    "details": {"code": "SPICE_CLEANUP_ERROR"},
+                    "data": None,
+                }
+
+    if calculation_result is not None:
+        return calculation_result
+
+    elevations = [pt["earth_elevation_deg"] for pt in timeline]
+    visible_count = sum(1 for pt in timeline if pt["is_earth_visible"])
+    total_steps = len(timeline)
+
+    visibility_fraction = round(visible_count / total_steps, 4) if total_steps > 0 else 0.0
+    if visibility_fraction >= 0.999:
+        los_status = "CONTINUOUS"
+    elif visibility_fraction > 0.0:
+        los_status = "INTERMITTENT"
     else:
-        # Fallback only when explicitly requested
-        earth_elev_datum, earth_azimuth = compute_approximate_earth_direction(site_lat, site_lon)
-        method_desc = "SIMULATED_MEAN_LOCKING"
+        los_status = "NO_DIRECT_LINE_OF_SIGHT"
 
-    print("=" * 75)
-    print("LUNARSIGHT - EARTH VISIBILITY ANALYSIS")
-    print("=" * 75)
-    print(f"Mode: {method_desc}\n")
-
-    if not dem_path.exists():
-        raise FileNotFoundError(f"DEM raster not found at: {dem_path}")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # 1. Read DEM in read-only mode
-    with rasterio.open(dem_path, "r") as src:
-        elevation = src.read(1)
-        res_m = abs(src.transform.a)
-        width = src.width
-        height = src.height
-
-    print(f"Loaded DEM : {dem_path.name} ({width} x {height} pixels)")
-    print(f"Target Site: Lat {site_lat}°, Lon {site_lon}° (Shackleton South Pole Region)")
-
-    # 2. Earth direction details
-    print(f"\nEarth Direction:")
-    print(f"  • Elevation Angle           : {earth_elev_datum:+.2f}° above spherical datum")
-    print(f"  • Antenna Bearing (Azimuth) : {earth_azimuth:.1f}° (Direction toward Earth)")
-
-    # 3. Terrain-adjusted Visibility Analysis
-    # At polar latitudes, positive elevation (crater rims) expands the horizon by dip angle:
-    # theta_dip ~= sqrt(2 * max(0, h) / R_moon)
-    # Inside craters (negative h), crater walls create positive obstruction angles.
-    rows, cols = elevation.shape
-    mid_r, mid_c = rows // 2, cols // 2
-    rim_r, rim_c = mid_r, mid_c + int(10500 / res_m)
-
-    # Calculate effective elevation above local horizon:
-    # A location has direct line-of-sight to Earth if its local elevation provides
-    # positive clearance over surrounding terrain toward Earth's azimuth.
-    # In Shackleton DEM, rim crest sits at ~+1250 m; floor sits at -3000 m.
-    # Floor horizon obstruction toward Earth is ~+8° to +12° (blocking Earth at +0.1°).
-    # Rim crest horizon dip is ~-2.2°, making Earth appear ~+2.3° above local horizon!
-    
-    # 2D Visibility Grid: True = Earth Visible, False = Earth Not Visible
-    # Terrain threshold: elevations above -500 m clear the polar line of sight to Earth
-    visibility_mask = elevation >= -200.0
-
-    # Specific site evaluation
-    elev_rim = float(elevation[rim_r, rim_c])
-    elev_floor = float(elevation[mid_r, mid_c])
-
-    rim_visible = bool(visibility_mask[rim_r, rim_c])
-    floor_visible = bool(visibility_mask[mid_r, mid_c])
-
-    print("\nLocal Site Visibility Assessment:")
-    print(f"  [1] Shackleton Crater Rim (Elev: {elev_rim:+.0f} m): "
-          f"{'EARTH VISIBLE' if rim_visible else 'EARTH NOT VISIBLE'}")
-    print(f"  [2] Shackleton Crater Floor (Elev: {elev_floor:+.0f} m): "
-          f"{'EARTH VISIBLE' if floor_visible else 'EARTH NOT VISIBLE'}")
-
-    pct_visible = float(np.sum(visibility_mask) / visibility_mask.size) * 100.0
-    pct_blocked = 100.0 - pct_visible
-
-    print(f"\nRegional Visibility Coverage:")
-    print(f"  • Earth Visible Area     : {pct_visible:.1f}% (Highlands, ridges & crater rims)")
-    print(f"  • Earth Not Visible Area : {pct_blocked:.1f}% (Deep crater basins & shadowed valleys)")
-
-    # 4. Generate Visualization
-    extent_km = [
-        -(width * res_m) / 2000.0,
-        (width * res_m) / 2000.0,
-        -(height * res_m) / 2000.0,
-        (height * res_m) / 2000.0
-    ]
-
-    fig, ax = plt.subplots(figsize=(10, 8.5), dpi=300)
-
-    # Custom colormap: Dark Blue (Not Visible) vs Bright Cyan (Visible)
-    cmap_vis = ListedColormap(["#0a1538", "#00d2ff"])
-
-    im = ax.imshow(
-        visibility_mask.astype(int),
-        cmap=cmap_vis,
-        extent=extent_km,
-        origin="upper"
-    )
-
-    # Annotations for Shackleton Rim and Floor
-    ax.plot(0, 0, marker="x", color="#ff5252", markersize=10, markeredgewidth=2)
-    ax.annotate(
-        f"Crater Floor: {elev_floor:+.0f} m\n-> Earth Not Visible",
-        xy=(0, 0),
-        xytext=(-8, -8),
-        color="#ff5252",
-        fontweight="bold",
-        fontsize=9,
-        arrowprops=dict(facecolor="#ff5252", shrink=0.05, width=1.5, headwidth=6)
-    )
-
-    rim_x = (rim_c - mid_c) * res_m / 1000.0
-    rim_y = (mid_r - rim_r) * res_m / 1000.0
-    ax.plot(rim_x, rim_y, marker="o", color="#ffff00", markersize=8)
-    ax.annotate(
-        f"Crater Rim: {elev_rim:+.0f} m\n-> Earth Visible",
-        xy=(rim_x, rim_y),
-        xytext=(4, 8),
-        color="#ffff00",
-        fontweight="bold",
-        fontsize=9,
-        arrowprops=dict(facecolor="#ffff00", shrink=0.05, width=1.5, headwidth=6)
-    )
-
-    # Earth direction indicator
-    az_rad = math.radians(earth_azimuth)
-    arrow_dx = math.sin(az_rad) * 4.0
-    arrow_dy = math.cos(az_rad) * 4.0
-    ax.arrow(
-        -11, -11, arrow_dx, arrow_dy,
-        head_width=1.2, head_length=1.5,
-        fc="#00d2ff", ec="white", width=0.4, alpha=0.9
-    )
-    ax.text(-11, -13.5, f"Vector to Earth\nAzimuth: {earth_azimuth:.1f}°", color="white", fontsize=8, fontweight="bold")
-
-    # Titles and Legends
-    ax.set_title(
-        "Lunar South Pole - Direct-to-Earth (DTE) Line-of-Sight Visibility\n"
-        "[SIMPLIFIED GEOMETRIC ESTIMATION - MEAN TIDAL LOCKING]",
-        fontsize=12, fontweight="bold", pad=12
-    )
-    ax.set_xlabel("Polar Stereographic Distance X (km)", fontsize=10)
-    ax.set_ylabel("Polar Stereographic Distance Y (km)", fontsize=10)
-    ax.grid(color="gray", linestyle=":", linewidth=0.5, alpha=0.3)
-
-    # Legend box
-    ax.text(
-        0.02, 0.96,
-        f"Cyan : Earth Visible ({pct_visible:.1f}%)\n"
-        f"Blue : Earth Not Visible ({pct_blocked:.1f}%)",
-        transform=ax.transAxes,
-        color="white",
-        fontsize=9,
-        fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#000000", alpha=0.8, edgecolor="#00d2ff")
-    )
-
-    if save_image:
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"\nEarth visibility map successfully saved to: {output_path}")
-    else:
-        plt.close(fig)
+    summary = {
+        "total_timesteps": total_steps,
+        "mean_earth_elevation_deg": round(float(np.mean(elevations)), 4) if elevations else None,
+        "max_earth_elevation_deg": round(float(np.max(elevations)), 4) if elevations else None,
+        "min_earth_elevation_deg": round(float(np.min(elevations)), 4) if elevations else None,
+        "geometric_visibility_fraction": visibility_fraction,
+        "line_of_sight_status": los_status,
+        "terrain_obstruction_analysis": terrain_analysis_status,
+        "terrain_obstruction_notes": terrain_note,
+        "classification_definition": "FULL/PARTIAL/OCCULTED classifies geometric Earth-disk elevation relative to the mean spherical horizon. It does not account for terrain topography, local relief, or RF link margins."
+    }
 
     return {
         "status": "SUCCESS",
-        "method": method_desc,
-        "site_lat": site_lat,
-        "site_lon": site_lon,
-        "earth_elevation_deg": round(float(earth_elev_datum), 2),
-        "earth_azimuth_deg": round(float(earth_azimuth), 1),
-        "rim_status": "Earth Visible" if rim_visible else "Earth Not Visible",
-        "floor_status": "Earth Visible" if floor_visible else "Earth Not Visible",
-        "pct_visible": round(float(pct_visible), 1),
-        "pct_blocked": round(float(pct_blocked), 1),
-        "output_image_path": str(output_path)
+        "site": {
+            "latitude_deg": latitude_deg,
+            "longitude_deg": norm_lon_deg,
+            "coordinate_system": COORDINATE_SYSTEM,
+            "longitude_convention": LONGITUDE_CONVENTION,
+            "radius_m": LUNAR_RADIUS_METRES,
+            "distance_units": DISTANCE_UNITS,
+            "elevation_units": ELEVATION_UNITS
+        },
+        "reference_frame": LUNAR_REFERENCE_FRAME,
+        "kernels_used": loaded_kernels,
+        "time_range": {
+            "start_time_utc": start_time_utc,
+            "end_time_utc": end_time_utc,
+            "step_hours": step_hours
+        },
+        "summary": summary,
+        "timeline": timeline
     }
-
-
-# Backwards compatibility alias
-evaluate_earth_visibility = calculate_earth_visibility
-
-
-# -----------------------------------------------------------------------------
-# Optional Advanced NASA SPICE Calculation (Preserved for Benchmark Suite)
-# -----------------------------------------------------------------------------
-def compute_earth_position(
-    utc_time_str: str,
-    lat_deg: float,
-    lon_deg: float,
-    elevation_km: float = 0.0,
-    lunar_frame: str = "IAU_MOON"
-) -> dict[str, Any]:
-    """
-    Computes Earth visibility geometry using NASA NAIF SPICE ephemeris (de440s / pck).
-    Used by the validation benchmark suite for precision libration checks.
-    """
-    import spiceypy as spice
-    from .sun_position import (
-        init_spice,
-        lunar_latlon_to_cartesian,
-        get_topocentric_basis
-    )
-    init_spice()
-    et = spice.str2et(utc_time_str)
-
-    r_site_moon = lunar_latlon_to_cartesian(lat_deg, lon_deg, elevation_km)
-    pos_earth_moon, _ = spice.spkpos("EARTH", et, lunar_frame, "LT+S", "MOON")
-    r_earth_moon = np.array(pos_earth_moon)
-
-    r_earth_topo = r_earth_moon - r_site_moon
-    dist_km = float(np.linalg.norm(r_earth_topo))
-
-    u_east, u_north, u_zenith = get_topocentric_basis(lat_deg, lon_deg)
-    e_coord = float(np.dot(r_earth_topo, u_east))
-    n_coord = float(np.dot(r_earth_topo, u_north))
-    z_coord = float(np.dot(r_earth_topo, u_zenith))
-
-    sin_elev = max(-1.0, min(1.0, z_coord / dist_km))
-    elev_deg = math.degrees(math.asin(sin_elev))
-    azimuth_deg = math.degrees(math.atan2(e_coord, n_coord))
-    if azimuth_deg < 0:
-        azimuth_deg += 360.0
-
-    sub_dist, sub_lon_rad, sub_lat_rad = spice.reclat(r_earth_moon)
-
-    return {
-        "utc_time": utc_time_str,
-        "ephemeris_time": et,
-        "earth_elevation_deg": round(elev_deg, 4),
-        "earth_azimuth_deg": round(azimuth_deg, 4),
-        "earth_distance_km": round(dist_km, 1),
-        "sub_earth_lat_deg": round(math.degrees(sub_lat_rad), 3),
-        "sub_earth_lon_deg": round(math.degrees(sub_lon_rad), 3),
-        "dte_link_active": elev_deg > 0.0,
-        "visibility_status": "VISIBLE" if elev_deg > 0.0 else "OCCULTED"
-    }
-
-
-if __name__ == "__main__":
-    calculate_earth_visibility(DEM_PATH, OUTPUT_IMAGE)
