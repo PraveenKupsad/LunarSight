@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# LunarSight local NASA datasets and generated outputs
+data/raw/*
+!data/raw/.gitkeep
+
+data/spice_kernels/*
+!data/spice_kernels/.gitkeep
+
+data/processed/*
+!data/processed/.gitkeep
