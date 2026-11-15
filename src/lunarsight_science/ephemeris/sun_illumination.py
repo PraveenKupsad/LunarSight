@@ -1,311 +1,847 @@
+"""Solar illumination calculations for the Lunar South Pole.
+
+Calculates geometric solar elevation, azimuth, and geometric solar-disk
+visibility for coordinates on the lunar surface using NASA/JPL SPICE
+ephemerides in the designated Mean Earth / Polar Axis (MOON_ME) frame.
+
+IMPORTANT SCIENTIFIC LIMITATIONS:
+1. Illumination states (FULL/PARTIAL/DARK) are strictly geometric solar-disk
+   horizon classifications relative to an idealized lunar reference sphere.
+   They DO NOT represent physical surface illumination percentage, regolith
+   albedo, shadows cast by local topography/rocks, or solar power/energy flux.
+2. Optional terrain-Sun classifications describe only a sampled,
+   piecewise-linear horizon model. They do not certify continuous lunar
+   terrain, and MOON_ME frame alignment remains pending kernel validation.
+3. Millimeter or flight-grade accuracy is not claimed; calculations reflect
+   ephemeris-derived geometric vectors without empirical validation against
+   in-situ landing telemetry.
 """
-LunarSight - Lunar South Pole Solar Illumination Simulation
-============================================================
-Calculates terrain slope, aspect, and direct solar illumination across a
-LOLA Digital Elevation Model (DEM) using a simulated grazing Sun vector.
 
-DISCLAIMER & SCIENTIFIC NOTICE:
--------------------------------
-This module provides a SIMPLIFIED GEOMETRIC SIMULATION of solar illumination
-using a fixed Sun azimuth and elevation angle. It does NOT yet incorporate the
-real-time, dynamic NASA NAIF SPICE planetary ephemeris (which is implemented in
-`sun_position.py`). It is designed for baseline topographic lighting analysis.
-
-Inputs:
-- DEM: data/raw/lola/MOON_LRO_NAC_DEM_89S210E_4mp.tif (read-only, not modified)
-
-Outputs:
-- Visualization: data/processed/sun_illumination.png
-"""
-
-import math
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from numbers import Integral, Real
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
+import math
 import numpy as np
-import rasterio
 
-# Set non-interactive Agg backend before importing pyplot to prevent GUI pop-ups
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
+try:
+    import spiceypy as spice
+    HAS_SPICEYPY = True
+except ImportError:
+    HAS_SPICEYPY = False
 
-from ..data_collection.spice_manager import DEFAULT_KERNEL_DIR, REQUIRED_KERNELS
+from ..config import (
+    FRAME_VALIDATION_STATUS,
+    LUNAR_REFERENCE_FRAME,
+    LUNAR_RADIUS_METRES,
+    SPICE_KERNELS_DIR,
+    LOLA_DEM_IMAGE_PATH,
+    LOLA_DEM_LABEL_PATH,
+    COORDINATE_SYSTEM,
+    LONGITUDE_CONVENTION,
+    DISTANCE_UNITS,
+    ELEVATION_UNITS,
+)
+from ..terrain.lola_dem import (
+    LolaDemError,
+    LolaDemReader,
+    LolaImageError,
+    LolaLabelError,
+)
+from ..terrain.terrain_horizon import (
+    TerrainHorizonError,
+    TerrainHorizonProfile,
+    calculate_terrain_horizon,
+    local_site_frame,
+    validate_horizon_sampling_parameters,
+)
+from ..terrain.terrain_sun_visibility import (
+    MAX_DISK_WITNESS_SAMPLES,
+    TerrainSunVisibility,
+    classify_solar_disk_against_terrain,
+)
 
-# Define project paths
-MODULE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = MODULE_DIR.parent.parent.parent
-DEM_PATH = PROJECT_ROOT / "data" / "raw" / "lola" / "MOON_LRO_NAC_DEM_89S210E_4mp.tif"
-OUTPUT_DIR = PROJECT_ROOT / "data" / "processed"
-OUTPUT_IMAGE = OUTPUT_DIR / "sun_illumination.png"
+# Standard nominal solar radius in metres (IAU standard: 696,340 km)
+SOLAR_RADIUS_METRES = 696340000.0
 
-
-def compute_slope_aspect(elevation: np.ndarray, cell_size_m: float = 100.0) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Computes slope and aspect angles across the DEM in radians.
-    - Slope: Angle between terrain surface normal and the vertical [0, pi/2]
-    - Aspect: Azimuth direction that the slope faces [0, 2*pi] (clockwise from North)
-    """
-    # Gradients along rows (Y / North-South) and columns (X / East-West)
-    dz_dy, dz_dx = np.gradient(elevation, cell_size_m, cell_size_m)
-
-    # Slope in radians
-    slope = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
-
-    # Aspect in radians clockwise from North (dx / -dy)
-    aspect = np.arctan2(dz_dx, -dz_dy)
-    aspect = np.where(aspect < 0, aspect + 2 * np.pi, aspect)
-
-    return slope, aspect
-
-
-def compute_cast_shadows(
-    elevation: np.ndarray,
-    sun_elev_rad: float,
-    sun_azimuth_rad: float,
-    cell_size_m: float = 100.0
-) -> np.ndarray:
-    """
-    Computes terrain cast shadows (ray-tracing across topography).
-    Returns a boolean mask: True = illuminated, False = shadowed by peaks.
-    """
-    rows, cols = elevation.shape
-    illuminated = np.ones((rows, cols), dtype=bool)
-
-    # Unit step in direction toward the Sun
-    # Azimuth 0° is North (-dy in image row coordinates), 90° is East (+dx in col coordinates)
-    step_x = np.sin(sun_azimuth_rad)
-    step_y = -np.cos(sun_azimuth_rad)
-
-    tan_elev = np.tan(sun_elev_rad)
-    max_steps = int(min(rows, cols) * 0.8)
-
-    # Ray-trace out from each pixel toward the Sun
-    for step in range(1, max_steps):
-        dist_m = step * cell_size_m
-        min_blocking_z_delta = dist_m * tan_elev
-
-        shift_r = int(round(step * step_y))
-        shift_c = int(round(step * step_x))
-
-        # Check ray bounds
-        r_start = max(0, -shift_r)
-        r_end = min(rows, rows - shift_r)
-        c_start = max(0, -shift_c)
-        c_end = min(cols, cols - shift_c)
-
-        if r_start >= r_end or c_start >= c_end:
-            break
-
-        current_z = elevation[r_start:r_end, c_start:c_end]
-        target_r = r_start + shift_r
-        target_c = c_start + shift_c
-        blocking_z = elevation[target_r:target_r + (r_end - r_start), target_c:target_c + (c_end - c_start)]
-
-        # If terrain in the direction of the Sun is higher than ray altitude, it casts shadow
-        blocked = (blocking_z - current_z) > min_blocking_z_delta
-        illuminated[r_start:r_end, c_start:c_end] &= ~blocked
-
-    return illuminated
+# Maximum allowed timesteps per calculation request to prevent DoS / memory exhaustion
+MAX_ALLOWED_TIMESTEPS = 8760  # e.g., 1 year at 1-hour resolution
+MAX_SAFE_LONGITUDE_DEG = float(2**53)
+# Keep longitude reduction within the exact-integer range of IEEE-754 doubles.
+# Reject sub-resolution steps to prevent timedelta rounding to zero.
+MIN_STEP_HOURS = timedelta.resolution.total_seconds() / 3600.0
+# Steps cannot exceed the full range representable by Python's datetime values.
+MAX_STEP_HOURS = (datetime.max - datetime.min).total_seconds() / 3600.0
 
 
-def check_spice_kernels() -> None:
-    """Verifies that all required NASA SPICE kernels are present on disk."""
-    for kernel_name in REQUIRED_KERNELS:
-        kernel_path = DEFAULT_KERNEL_DIR / kernel_name
-        if not kernel_path.exists() or kernel_path.stat().st_size == 0:
-            raise RuntimeError(
-                f"NASA SPICE kernel '{kernel_name}' is missing from {DEFAULT_KERNEL_DIR}.\n"
-                f"Run 'python -m src.lunarsight_science.data_collection.spice_manager' to download it."
-            )
+@dataclass(frozen=True)
+class TerrainSunOptions:
+    """Explicit sampling and classification settings for terrain-Sun analysis."""
+
+    max_distance_m: float
+    radial_step_m: float
+    azimuth_step_deg: float
+    required_coverage_distance_m: float
+    classification_tolerance_deg: float
+    disk_sample_spacing_deg: float
+    max_disk_samples: int
 
 
-def calculate_sun_illumination(
-    dem_path: Path = DEM_PATH,
-    output_path: Path = OUTPUT_IMAGE,
-    sun_elevation_deg: float | None = None,
-    sun_azimuth_deg: float | None = None,
-    utc_time_str: str | None = None,
-    save_image: bool = True
-) -> dict[str, Any]:
-    """
-    Calculates lunar surface illumination across the DEM using slope, aspect, and cast shadows.
-    By default (when no datetime is provided), it uses the current UTC time and calculates the
-    Sun position dynamically using NASA SPICE kernels.
+def _finite_option(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a finite real number.")
+    try:
+        converted = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{name} must be a finite real number.") from exc
+    if not math.isfinite(converted):
+        raise ValueError(f"{name} must be a finite real number.")
+    return converted
 
-    Returns:
-    - dict with pct_illuminated, pct_shadowed, sun_elevation_deg, sun_azimuth_deg, output_image_path.
-    """
-    # 1. Determine Sun angles: Default to NASA SPICE dynamic calculation
-    if sun_elevation_deg is None or sun_azimuth_deg is None:
-        # Verify SPICE kernels are present; do not silently simulate
-        check_spice_kernels()
 
-        # Default to current UTC time if not specified
-        if utc_time_str is None:
-            utc_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def _finite_science_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(converted):
+        return None
+    return converted
 
-        from .sun_position import compute_sun_position
-        spice_res = compute_sun_position(utc_time_str, lat_deg=-89.9, lon_deg=0.0)
-        sun_elevation_deg = spice_res["solar_elevation_deg"]
-        sun_azimuth_deg = spice_res["solar_azimuth_deg"]
-        method_desc = f"NASA_SPICE_DYNAMIC ({utc_time_str})"
-    else:
-        method_desc = f"CUSTOM_VECTOR (Elev={sun_elevation_deg:+.1f}°, Az={sun_azimuth_deg:.1f}°)"
 
-    print("=" * 75)
-    print("LUNARSIGHT - LUNAR SOLAR ILLUMINATION ANALYSIS")
-    print("=" * 75)
-    print(f"Mode: {method_desc}\n")
+def _validate_terrain_options(
+    use_terrain_horizon: bool,
+    terrain_options: TerrainSunOptions | None,
+) -> TerrainSunOptions | None:
+    if not isinstance(use_terrain_horizon, bool):
+        raise ValueError("use_terrain_horizon must be a boolean.")
+    if use_terrain_horizon and terrain_options is None:
+        raise ValueError(
+            "terrain_options is required when use_terrain_horizon is true."
+        )
+    if not use_terrain_horizon and terrain_options is not None:
+        raise ValueError(
+            "terrain_options cannot be supplied when use_terrain_horizon is false."
+        )
+    if terrain_options is None:
+        return None
+    if not isinstance(terrain_options, TerrainSunOptions):
+        raise ValueError("terrain_options must be a TerrainSunOptions instance.")
 
-    if not dem_path.exists():
-        raise FileNotFoundError(f"DEM not found at: {dem_path}")
+    max_distance = _finite_option(
+        terrain_options.max_distance_m,
+        "terrain_options.max_distance_m",
+    )
+    radial_step = _finite_option(
+        terrain_options.radial_step_m,
+        "terrain_options.radial_step_m",
+    )
+    azimuth_step = _finite_option(
+        terrain_options.azimuth_step_deg,
+        "terrain_options.azimuth_step_deg",
+    )
+    required_distance = _finite_option(
+        terrain_options.required_coverage_distance_m,
+        "terrain_options.required_coverage_distance_m",
+    )
+    tolerance = _finite_option(
+        terrain_options.classification_tolerance_deg,
+        "terrain_options.classification_tolerance_deg",
+    )
+    sample_spacing = _finite_option(
+        terrain_options.disk_sample_spacing_deg,
+        "terrain_options.disk_sample_spacing_deg",
+    )
+    if (
+        isinstance(terrain_options.max_disk_samples, bool)
+        or not isinstance(terrain_options.max_disk_samples, Integral)
+        or terrain_options.max_disk_samples <= 0
+    ):
+        raise ValueError(
+            "terrain_options.max_disk_samples must be a positive integer."
+        )
+    if terrain_options.max_disk_samples > MAX_DISK_WITNESS_SAMPLES:
+        raise ValueError(
+            "terrain_options.max_disk_samples exceeds the operational limit "
+            f"of {MAX_DISK_WITNESS_SAMPLES}."
+        )
+    if required_distance <= 0.0:
+        raise ValueError(
+            "terrain_options.required_coverage_distance_m must be positive."
+        )
+    if required_distance > max_distance:
+        raise ValueError(
+            "terrain_options.required_coverage_distance_m cannot exceed "
+            "terrain_options.max_distance_m."
+        )
+    if not 0.0 < tolerance < 180.0:
+        raise ValueError(
+            "terrain_options.classification_tolerance_deg must be in (0, 180)."
+        )
+    if not 0.0 < sample_spacing <= 180.0:
+        raise ValueError(
+            "terrain_options.disk_sample_spacing_deg must be in (0, 180]."
+        )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # 1. Read DEM in read-only mode
-    with rasterio.open(dem_path, "r") as src:
-        elevation = src.read(1)
-        res_m = abs(src.transform.a)
-        width = src.width
-        height = src.height
-
-    print(f"Loaded DEM : {dem_path.name} ({width}x{height} pixels, {res_m:.1f} m/pixel)")
-    print(f"Sun Direction: Elevation = {sun_elevation_deg:+.2f}°, Azimuth = {sun_azimuth_deg:.1f}°")
-
-    sun_elev_rad = math.radians(sun_elevation_deg)
-    sun_azimuth_rad = math.radians(sun_azimuth_deg)
-
-    # 2. Calculate Slope and Aspect
-    slope_rad, aspect_rad = compute_slope_aspect(elevation, cell_size_m=res_m)
-
-    # 3. Calculate Direct Solar Incidence (Lambertian Cosine Law)
-    # cos(i) = cos(slope) * sin(sun_elev) + sin(slope) * cos(sun_elev) * cos(sun_az - aspect)
-    cos_incidence = (
-        np.cos(slope_rad) * np.sin(sun_elev_rad) +
-        np.sin(slope_rad) * np.cos(sun_elev_rad) * np.cos(sun_azimuth_rad - aspect_rad)
+    validate_horizon_sampling_parameters(
+        max_distance,
+        radial_step,
+        azimuth_step,
+    )
+    return TerrainSunOptions(
+        max_distance_m=max_distance,
+        radial_step_m=radial_step,
+        azimuth_step_deg=azimuth_step,
+        required_coverage_distance_m=required_distance,
+        classification_tolerance_deg=tolerance,
+        disk_sample_spacing_deg=sample_spacing,
+        max_disk_samples=int(terrain_options.max_disk_samples),
     )
 
-    # Direct slope illumination (0.0 to 1.0)
-    direct_illum = np.clip(cos_incidence, 0.0, 1.0)
 
-    # 4. Compute Cast Shadows (terrain ray-tracing)
-    print("Computing terrain cast shadows across crater topography...")
-    cast_shadow_mask = compute_cast_shadows(elevation, sun_elev_rad, sun_azimuth_rad, cell_size_m=res_m)
-
-    # Combined illumination: zero where blocked by cast shadow
-    final_illumination = direct_illum * cast_shadow_mask
-
-    # Calculate statistics
-    illuminated_pixels = np.sum(final_illumination > 0.05)
-    shadowed_pixels = np.sum(final_illumination <= 0.05)
-    total_pixels = final_illumination.size
-    pct_illuminated = (illuminated_pixels / total_pixels) * 100.0
-    pct_shadowed = (shadowed_pixels / total_pixels) * 100.0
-
-    print(f"\nIllumination Results (Simulated Sun at {sun_elevation_deg:+.1f}°):")
-    print(f"  • Illuminated Surface Area : {pct_illuminated:.1f}% (Rim crests & slopes facing Sun)")
-    print(f"  • In Deep Shadow (PSRs)    : {pct_shadowed:.1f}% (Crater interior & blocked valleys)")
-
-    # 5. Create Custom Colormap: Dark Blue (Shadowed) to Bright Yellow (Illuminated)
-    colors = [
-        (0.00, "#050b1e"),  # Deep Navy Dark Blue (0% illumination / total shadow)
-        (0.15, "#0b2055"),  # Midnight Blue
-        (0.40, "#1f4e99"),  # Intermediate Blue
-        (0.70, "#c2c200"),  # Golden Yellow transition
-        (1.00, "#ffff00")   # Radiant Bright Yellow (100% direct sunlight)
-    ]
-    sun_cmap = LinearSegmentedColormap.from_list(
-        "LunarSunShadow",
-        [(pos, col) for pos, col in colors]
-    )
-
-    # 6. Render Map with Matplotlib
-    extent_km = [
-        -(width * res_m) / 2000.0,
-        (width * res_m) / 2000.0,
-        -(height * res_m) / 2000.0,
-        (height * res_m) / 2000.0
-    ]
-
-    fig, ax = plt.subplots(figsize=(10, 8.5), dpi=300)
-
-    im = ax.imshow(
-        final_illumination,
-        cmap=sun_cmap,
-        vmin=0.0,
-        vmax=1.0,
-        extent=extent_km,
-        origin="upper"
-    )
-
-    # Colorbar
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Simulated Sunlight Illumination Index [0.0 = Shadow, 1.0 = Full Sun]", fontsize=10, fontweight="bold")
-    cbar.set_ticks([0.0, 0.25, 0.5, 0.75, 1.0])
-    cbar.set_ticklabels(["0.0 (Dark Shadow)", "0.25", "0.50", "0.75", "1.0 (Bright Sun)"])
-
-    # Sun direction arrow indicator
-    arrow_dx = math.sin(sun_azimuth_rad) * 4.0
-    arrow_dy = math.cos(sun_azimuth_rad) * 4.0
-    ax.arrow(
-        -11, -11, arrow_dx, arrow_dy,
-        head_width=1.2, head_length=1.5,
-        fc="#ffff00", ec="white", width=0.4, alpha=0.9
-    )
-    ax.text(-11, -13.5, f"Sun Vector\nAz: {sun_azimuth_deg:.0f}° | Elev: {sun_elevation_deg:+.1f}°", color="white", fontsize=8, fontweight="bold")
-
-    # Titles and Subtitles
-    ax.set_title(
-        "Lunar South Pole - Simulated Solar Sunlight Illumination\n"
-        "[SIMPLIFIED SIMULATION - NOT REAL-TIME NASA/SPICE EPHEMERIS]",
-        fontsize=12, fontweight="bold", pad=12
-    )
-    ax.set_xlabel("Polar Stereographic Distance X (km)", fontsize=10)
-    ax.set_ylabel("Polar Stereographic Distance Y (km)", fontsize=10)
-    ax.grid(color="gray", linestyle=":", linewidth=0.5, alpha=0.4)
-
-    # Status annotations
-    ax.text(
-        0.02, 0.96,
-        f"Illuminated (Bright Yellow): {pct_illuminated:.1f}%\n"
-        f"Shadowed (Dark Blue)        : {pct_shadowed:.1f}%",
-        transform=ax.transAxes,
-        color="white",
-        fontsize=9,
-        fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#000000", alpha=0.75, edgecolor="#ffff00")
-    )
-
-    if save_image:
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        print(f"\nSunlight illumination map successfully saved to: {output_path}")
-    else:
-        plt.close(fig)
-
+def _terrain_data_error(code: str, message: str) -> Dict[str, Any]:
     return {
-        "status": "SUCCESS",
-        "method": method_desc,
-        "sun_elevation_deg": round(float(sun_elevation_deg), 3),
-        "sun_azimuth_deg": round(float(sun_azimuth_deg), 2),
-        "pct_illuminated": round(float(pct_illuminated), 2),
-        "pct_shadowed": round(float(pct_shadowed), 2),
-        "total_pixels": int(total_pixels),
-        "illuminated_pixels": int(illuminated_pixels),
-        "shadowed_pixels": int(shadowed_pixels),
-        "output_image_path": str(output_path)
+        "status": "TERRAIN_DATA_ERROR",
+        "error": message,
+        "details": {"code": code},
+        "data": None,
     }
 
 
-# Backwards compatibility alias
-simulate_sun_illumination = calculate_sun_illumination
+class _SunCalculationResponse(Exception):
+    def __init__(self, response: Dict[str, Any]) -> None:
+        self.response = response
 
 
-if __name__ == "__main__":
-    calculate_sun_illumination(
-        DEM_PATH,
-        OUTPUT_IMAGE
+def check_required_kernels(kernel_dir: Path) -> Dict[str, Any]:
+    """Inspects the kernel directory and identifies available and missing SPICE kernels.
+
+    Distinguishes:
+    - LSK: Leapseconds (*.tls)
+    - PCK (Text): Planetary physical constants (*.tpc)
+    - SPK: Planetary Ephemeris (*.bsp)
+    - BPC: Binary Lunar PCK (*.bpc) for high-precision lunar physical libration
+    - FK: Frame Kernel (*.tf) defining frame relationships for MOON_ME
+
+    Note: Frame kernels (*.tf) and binary PCKs (*.bpc) are distinct requirements
+    and neither replaces the other.
+    """
+    if not kernel_dir.exists() or not kernel_dir.is_dir():
+        return {
+            "all_present": False,
+            "kernel_dir": str(kernel_dir),
+            "found_files": [],
+            "missing_categories": [
+                "LSK (Leapseconds .tls)",
+                "PCK_TEXT (Planetary Constants .tpc)",
+                "SPK (Ephemeris .bsp)",
+                "BPC (Binary Lunar PCK .bpc)",
+                "FK (Frame Kernel .tf)"
+            ]
+        }
+
+    found_files = [p.name for p in kernel_dir.iterdir() if p.is_file()]
+
+    has_lsk = any(f.lower().endswith(".tls") for f in found_files)
+    has_pck = any(f.lower().endswith(".tpc") for f in found_files)
+    has_spk = any(f.lower().endswith(".bsp") for f in found_files)
+    has_bpc = any(f.lower().endswith(".bpc") for f in found_files)
+    has_fk = any(f.lower().endswith(".tf") for f in found_files)
+
+    missing = []
+    if not has_lsk:
+        missing.append("LSK (Leapseconds .tls, e.g., naif0012.tls)")
+    if not has_pck:
+        missing.append("PCK_TEXT (Planetary Constants .tpc, e.g., pck00010.tpc)")
+    if not has_spk:
+        missing.append("SPK (Ephemeris .bsp, e.g., de421.bsp or de440.bsp)")
+    if not has_bpc:
+        missing.append("BPC (Binary Lunar PCK .bpc, e.g., moon_pa_de421_1900-2050.bpc or moon_pa_de440_200625.bpc)")
+    if not has_fk:
+        missing.append("FK (Frame Kernel .tf, e.g., moon_080317.tf)")
+
+    return {
+        "all_present": (len(missing) == 0),
+        "kernel_dir": str(kernel_dir),
+        "found_files": found_files,
+        "missing_categories": missing
+    }
+
+
+def parse_utc_iso_string(timestamp_str: str) -> Optional[datetime]:
+    """Parses an ISO 8601 string and strictly verifies that an explicit UTC timezone is present.
+
+    Rejects naive timestamps or non-UTC offsets.
+    """
+    if not isinstance(timestamp_str, str):
+        return None
+    raw = timestamp_str.strip()
+    if not (raw.endswith("Z") or raw.endswith("+00:00") or raw.endswith("-00:00")):
+        return None  # Rejects naive or non-UTC timestamps
+
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None or dt.utcoffset() != timedelta(0):
+            return None
+        return dt
+    except Exception:
+        return None
+
+
+def calculate_sun_illumination(
+    latitude_deg: float,
+    longitude_deg: float,
+    start_time_utc: str,
+    end_time_utc: str,
+    step_hours: float = 1.0,
+    use_terrain_horizon: bool = False,
+    *,
+    terrain_options: TerrainSunOptions | None = None,
+) -> Dict[str, Any]:
+    """Calculates geometric solar position and solar-disk horizon classification.
+
+    Coordinates and Units:
+    - latitude_deg: Planetocentric latitude (-90.0 at South Pole to +90.0 at North Pole).
+    - longitude_deg: East-positive longitude (0.0 to 360.0 degrees).
+    - elevation / distances: Metres.
+    - Reference frame: MOON_ME (Mean Earth / Polar Axis).
+    - Exact Pole Azimuth Convention: At the exact pole (latitude = -90.0 deg), physical
+      North is undefined. By explicit coordinate convention, azimuth is measured
+      clockwise from the 0.0 deg Selenographic Meridian (direction towards Mean Earth).
+
+    Scientific & Horizon Clarifications:
+    - Illumination states (FULL, PARTIAL, DARK) represent the geometric visibility of the
+      solar disk relative to the local horizontal tangent plane on the mean lunar sphere.
+      They DO NOT indicate actual illuminated surface area, surface albedo, or solar power.
+    - Optional terrain classifications are separate from geometric results and describe
+      only the sampled piecewise-linear horizon model. They do not certify continuous
+      lunar terrain; MOON_ME frame alignment remains pending kernel validation.
+    - If required SPICE kernels are unavailable, returns status="MISSING_KERNELS".
+
+    Returns:
+        Dict[str, Any]: Structured calculation results matching the scientific interface.
+    """
+    # 1. Strict Input Validation (Reject NaN, Inf, Out-of-bounds)
+    latitude_value = _finite_science_number(latitude_deg)
+    if latitude_value is None:
+        return {
+            "status": "INVALID_INPUT",
+            "error": "Latitude must be a valid, finite real number.",
+            "data": None
+        }
+
+    if not (-90.0 <= latitude_value <= 90.0):
+        return {
+            "status": "INVALID_INPUT",
+            "error": f"Latitude {latitude_deg} is out of bounds. Must be between -90.0 and +90.0 degrees ({COORDINATE_SYSTEM}).",
+            "data": None
+        }
+
+    longitude_value = _finite_science_number(longitude_deg)
+    if longitude_value is None:
+        return {
+            "status": "INVALID_INPUT",
+            "error": "Longitude must be a valid, finite real number.",
+            "data": None
+        }
+
+    if abs(longitude_deg) > MAX_SAFE_LONGITUDE_DEG:
+        return {
+            "status": "INVALID_INPUT",
+            "error": (
+                "Longitude magnitude exceeds the safe range for degree "
+                "normalization."
+            ),
+            "data": None
+        }
+
+    step_hours_value = _finite_science_number(step_hours)
+    if step_hours_value is None or step_hours_value <= 0.0:
+        return {
+            "status": "INVALID_INPUT",
+            "error": "step_hours must be a finite positive number.",
+            "data": None
+        }
+    if step_hours_value < MIN_STEP_HOURS:
+        return {
+            "status": "INVALID_INPUT",
+            "error": (
+                "step_hours must be at least one microsecond to advance "
+                "the UTC timeline safely."
+            ),
+            "data": None
+        }
+    if step_hours_value > MAX_STEP_HOURS:
+        return {
+            "status": "INVALID_INPUT",
+            "error": "step_hours exceeds the supported datetime range.",
+            "data": None
+        }
+
+    try:
+        validated_terrain_options = _validate_terrain_options(
+            use_terrain_horizon,
+            terrain_options,
+        )
+    except ValueError as exc:
+        return {
+            "status": "INVALID_INPUT",
+            "error": str(exc),
+            "data": None,
+        }
+
+    norm_lon_deg = longitude_value % 360.0
+
+    # 2. Validate UTC Timestamps with Explicit Timezone Requirement
+    t_start = parse_utc_iso_string(start_time_utc)
+    if t_start is None:
+        return {
+            "status": "INVALID_INPUT",
+            "error": f"start_time_utc '{start_time_utc}' is invalid. Must be an ISO 8601 string with an explicit UTC timezone indicator (e.g. '2027-01-01T00:00:00Z').",
+            "data": None
+        }
+
+    t_end = parse_utc_iso_string(end_time_utc)
+    if t_end is None:
+        return {
+            "status": "INVALID_INPUT",
+            "error": f"end_time_utc '{end_time_utc}' is invalid. Must be an ISO 8601 string with an explicit UTC timezone indicator (e.g. '2027-01-02T00:00:00Z').",
+            "data": None
+        }
+
+    if t_end < t_start:
+        return {
+            "status": "INVALID_INPUT",
+            "error": "end_time_utc cannot be earlier than start_time_utc.",
+            "data": None
+        }
+
+    delta_step = timedelta(hours=step_hours_value)
+    duration = t_end - t_start
+    duration_microseconds = (
+        (duration.days * 86400 + duration.seconds) * 1_000_000
+        + duration.microseconds
     )
+    step_microseconds = (
+        (delta_step.days * 86400 + delta_step.seconds) * 1_000_000
+        + delta_step.microseconds
+    )
+    estimated_steps = duration_microseconds // step_microseconds + 1
+    if estimated_steps > MAX_ALLOWED_TIMESTEPS:
+        return {
+            "status": "INVALID_INPUT",
+            "error": f"Requested duration results in {estimated_steps} timesteps, exceeding the safety limit of {MAX_ALLOWED_TIMESTEPS}. Increase step_hours or reduce the time window.",
+            "data": None
+        }
+
+    # 3. Check SpiceyPy and Kernel Availability
+    if not HAS_SPICEYPY:
+        return {
+            "status": "DEPENDENCY_ERROR",
+            "error": "SpiceyPy library is not available in the current Python environment.",
+            "data": None
+        }
+
+    try:
+        kernel_check = check_required_kernels(SPICE_KERNELS_DIR)
+    except Exception:
+        return {
+            "status": "CALCULATION_ERROR",
+            "error": "SPICE kernel preflight failed.",
+            "details": {"code": "SPICE_KERNEL_PREFLIGHT_ERROR"},
+            "data": None,
+        }
+    if not kernel_check["all_present"]:
+        if use_terrain_horizon:
+            return {
+                "status": "MISSING_KERNELS",
+                "error": (
+                    "Required SPICE kernels are unavailable. Terrain-aware Sun "
+                    "calculations require complete MOON_ME kernel coverage."
+                ),
+                "details": {
+                    "found_files": kernel_check["found_files"],
+                    "missing_categories": kernel_check["missing_categories"],
+                },
+                "data": None,
+            }
+        return {
+            "status": "MISSING_KERNELS",
+            "error": (
+                f"Required SPICE kernels are not present in '{SPICE_KERNELS_DIR}'. "
+                f"Missing categories: {', '.join(kernel_check['missing_categories'])}. "
+                "High-precision calculations in MOON_ME require complete NAIF kernel coverage "
+                "(LSK, text PCK, ephemeris SPK, binary lunar PCK, and frame kernel)."
+            ),
+            "details": {
+                "kernel_dir": str(SPICE_KERNELS_DIR),
+                "found_files": kernel_check["found_files"],
+                "missing_categories": kernel_check["missing_categories"]
+            },
+            "data": None
+        }
+
+    # 4. Terrain Handling Clarification
+    terrain_analysis_status = "NOT_IMPLEMENTED"
+    terrain_note = (
+        "Terrain horizon analysis using DEM data is NOT_IMPLEMENTED in this module. "
+        "Reported values represent unmasked geometric solar-disk elevation relative to the mean lunar sphere."
+    )
+    if validated_terrain_options is not None:
+        terrain_note = (
+            "The legacy terrain_shadow_analysis marker remains NOT_IMPLEMENTED "
+            "and does not summarize the separate terrain_sun_visibility results. "
+            "Those results classify the solar disk against a sampled "
+            "piecewise-linear horizon only and do not certify continuous terrain."
+        )
+
+    # 5. SPICE Ephemeris Topocentric Calculation
+    loaded_kernels = []
+    timeline: List[Dict[str, Any]] = []
+    calculation_result: Dict[str, Any] | None = None
+
+    try:
+        # Furnish kernels
+        for f in SPICE_KERNELS_DIR.iterdir():
+            if f.is_file() and f.suffix.lower() in [".tls", ".tpc", ".bsp", ".bpc", ".tf"]:
+                spice.furnsh(str(f))
+                loaded_kernels.append(f.name)
+
+        # Verify that the MOON_ME reference frame is recognized in the loaded SPICE kernel pool
+        frame_code = spice.namfrm(LUNAR_REFERENCE_FRAME)
+        if frame_code == 0:
+            if use_terrain_horizon:
+                raise _SunCalculationResponse({
+                    "status": "FRAME_UNSUPPORTED",
+                    "error": (
+                        f"The loaded kernels do not support reference frame "
+                        f"'{LUNAR_REFERENCE_FRAME}'."
+                    ),
+                    "details": {"code": "FRAME_UNSUPPORTED"},
+                    "data": None,
+                })
+            raise _SunCalculationResponse({
+                "status": "FRAME_UNSUPPORTED",
+                "error": f"The loaded kernels do not support reference frame '{LUNAR_REFERENCE_FRAME}'. Ensure the appropriate frame kernel and binary PCK are present.",
+                "data": None
+            })
+
+        lat_rad = math.radians(latitude_value)
+        lon_rad = math.radians(norm_lon_deg)
+
+        # Site position in MOON_ME Cartesian coordinates (metres)
+        site_x = LUNAR_RADIUS_METRES * math.cos(lat_rad) * math.cos(lon_rad)
+        site_y = LUNAR_RADIUS_METRES * math.cos(lat_rad) * math.sin(lon_rad)
+        site_z = LUNAR_RADIUS_METRES * math.sin(lat_rad)
+        site_vec_m = np.array([site_x, site_y, site_z], dtype=float)
+
+        zenith_u = np.array([
+            math.cos(lat_rad) * math.cos(lon_rad),
+            math.cos(lat_rad) * math.sin(lon_rad),
+            math.sin(lat_rad)
+        ], dtype=float)
+
+        is_exact_pole = abs(latitude_value) >= 89.9999
+        terrain_profile: TerrainHorizonProfile | None = None
+        terrain_site_unit: np.ndarray | None = None
+        terrain_north_u: np.ndarray | None = None
+        terrain_east_u: np.ndarray | None = None
+        terrain_site_vec_m: np.ndarray | None = None
+
+        if validated_terrain_options is not None:
+            if not LOLA_DEM_LABEL_PATH.is_file():
+                raise _SunCalculationResponse(_terrain_data_error(
+                    "MISSING_DEM_LABEL",
+                    "The configured LOLA DEM label is unavailable.",
+                ))
+            if not LOLA_DEM_IMAGE_PATH.is_file():
+                raise _SunCalculationResponse(_terrain_data_error(
+                    "MISSING_DEM_IMAGE",
+                    "The configured LOLA DEM image is unavailable.",
+                ))
+            try:
+                with LolaDemReader() as dem:
+                    terrain_profile = calculate_terrain_horizon(
+                        dem,
+                        latitude_deg,
+                        None if latitude_deg == -90.0 else norm_lon_deg,
+                        max_distance_m=validated_terrain_options.max_distance_m,
+                        radial_step_m=validated_terrain_options.radial_step_m,
+                        azimuth_step_deg=validated_terrain_options.azimuth_step_deg,
+                    )
+            except LolaLabelError:
+                raise _SunCalculationResponse(_terrain_data_error(
+                    "DEM_LABEL_ERROR",
+                    "The configured LOLA DEM label is invalid or unreadable.",
+                ))
+            except LolaImageError:
+                raise _SunCalculationResponse(_terrain_data_error(
+                    "DEM_IMAGE_ERROR",
+                    "The configured LOLA DEM image is invalid or unreadable.",
+                ))
+            except TerrainHorizonError:
+                raise _SunCalculationResponse(_terrain_data_error(
+                    "INVALID_SITE_SAMPLE",
+                    "The LOLA DEM does not provide a valid elevation at the site.",
+                ))
+            except LolaDemError:
+                raise _SunCalculationResponse(_terrain_data_error(
+                    "DEM_READ_ERROR",
+                    "The LOLA DEM could not be read while building the horizon profile.",
+                ))
+            except ValueError:
+                raise _SunCalculationResponse(_terrain_data_error(
+                    "TERRAIN_PROFILE_ERROR",
+                    "The terrain-horizon profile could not be calculated.",
+                ))
+
+            (
+                terrain_site_up,
+                terrain_north,
+                terrain_east,
+            ) = local_site_frame(
+                terrain_profile.site_latitude_deg,
+                terrain_profile.site_longitude_deg,
+            )
+            terrain_site_unit = np.asarray(terrain_site_up, dtype=float)
+            terrain_north_u = np.asarray(terrain_north, dtype=float)
+            terrain_east_u = np.asarray(terrain_east, dtype=float)
+            terrain_site_radius_m = (
+                LUNAR_RADIUS_METRES + terrain_profile.site_elevation_m
+            )
+            terrain_site_vec_m = terrain_site_radius_m * terrain_site_unit
+
+        current_t = t_start
+
+        while current_t <= t_end:
+            iso_utc = current_t.strftime("%Y-%m-%dT%H:%M:%SZ")
+            et = spice.str2et(iso_utc)
+
+            # Retrieve Sun position relative to Moon center in MOON_ME (km -> metres)
+            # Note: Evaluated using light-time and stellar aberration ('LT+S') at Moon center,
+            # with topocentric parallax computed geometrically via site_vec_m.
+            sun_pos_km, _ = spice.spkpos("SUN", et, LUNAR_REFERENCE_FRAME, "LT+S", "MOON")
+            sun_pos_m = np.array(sun_pos_km, dtype=float) * 1000.0
+
+            # Topocentric vector from landing site to Sun
+            topo_vec_m = sun_pos_m - site_vec_m
+            dist_m = float(np.linalg.norm(topo_vec_m))
+
+            # Solar elevation angle above spherical tangent horizon
+            sin_elev = float(np.dot(topo_vec_m, zenith_u) / dist_m)
+            sin_elev = max(-1.0, min(1.0, sin_elev))
+            elev_deg = math.degrees(math.asin(sin_elev))
+
+            # Azimuth calculation
+            if is_exact_pole:
+                # Explicit convention at the pole: clockwise from 0° Selenographic Meridian
+                u_ref = np.array([1.0, 0.0, 0.0], dtype=float)
+                u_ortho = np.array([0.0, 1.0, 0.0], dtype=float)
+                az_deg = math.degrees(math.atan2(np.dot(topo_vec_m, u_ortho), np.dot(topo_vec_m, u_ref))) % 360.0
+            else:
+                east_u = np.array([-math.sin(lon_rad), math.cos(lon_rad), 0.0], dtype=float)
+                north_u = np.cross(zenith_u, east_u)
+                az_deg = math.degrees(math.atan2(np.dot(topo_vec_m, east_u), np.dot(topo_vec_m, north_u))) % 360.0
+
+            # Solar angular radius
+            sin_ang_rad = min(1.0, SOLAR_RADIUS_METRES / dist_m)
+            sun_angular_radius_deg = math.degrees(math.asin(sin_ang_rad))
+
+            # Geometric solar-disk horizon classification
+            if elev_deg > sun_angular_radius_deg:
+                disk_class = "FULL"
+                is_illuminated = True
+            elif elev_deg >= -sun_angular_radius_deg:
+                disk_class = "PARTIAL"
+                is_illuminated = True
+            else:
+                disk_class = "DARK"
+                is_illuminated = False
+
+            timeline_point = {
+                "timestamp_utc": iso_utc,
+                "sun_elevation_deg": round(elev_deg, 4),
+                "sun_azimuth_deg": round(az_deg, 4),
+                "sun_distance_m": round(dist_m, 2),
+                "sun_angular_radius_deg": round(sun_angular_radius_deg, 4),
+                "geometric_solar_disk_classification": disk_class,
+                "is_geometrically_illuminated": is_illuminated
+            }
+
+            if (
+                validated_terrain_options is not None
+                and terrain_profile is not None
+                and terrain_site_unit is not None
+                and terrain_north_u is not None
+                and terrain_east_u is not None
+                and terrain_site_vec_m is not None
+            ):
+                terrain_topo_vec_m = sun_pos_m - terrain_site_vec_m
+                terrain_dist_m = float(np.linalg.norm(terrain_topo_vec_m))
+                terrain_sin_elev = float(
+                    np.dot(terrain_topo_vec_m, terrain_site_unit)
+                    / terrain_dist_m
+                )
+                terrain_sin_elev = max(-1.0, min(1.0, terrain_sin_elev))
+                terrain_elev_deg = math.degrees(math.asin(terrain_sin_elev))
+                terrain_az_deg = math.degrees(
+                    math.atan2(
+                        np.dot(terrain_topo_vec_m, terrain_east_u),
+                        np.dot(terrain_topo_vec_m, terrain_north_u),
+                    )
+                ) % 360.0
+                terrain_sun_angular_radius_deg = math.degrees(
+                    math.asin(
+                        min(1.0, SOLAR_RADIUS_METRES / terrain_dist_m)
+                    )
+                )
+                terrain_visibility: TerrainSunVisibility = (
+                    classify_solar_disk_against_terrain(
+                        terrain_elev_deg,
+                        terrain_az_deg,
+                        terrain_sun_angular_radius_deg,
+                        terrain_profile,
+                        required_coverage_distance_m=(
+                            validated_terrain_options.required_coverage_distance_m
+                        ),
+                        classification_tolerance_deg=(
+                            validated_terrain_options.classification_tolerance_deg
+                        ),
+                        disk_sample_spacing_deg=(
+                            validated_terrain_options.disk_sample_spacing_deg
+                        ),
+                        max_disk_samples=(
+                            validated_terrain_options.max_disk_samples
+                        ),
+                    )
+                )
+                timeline_point["terrain_sun_visibility"] = {
+                    "sun_elevation_deg": round(terrain_elev_deg, 4),
+                    "sun_azimuth_deg": round(terrain_az_deg, 4),
+                    "sun_distance_m": round(terrain_dist_m, 2),
+                    "sun_angular_radius_deg": round(
+                        terrain_sun_angular_radius_deg,
+                        4,
+                    ),
+                    "classification": terrain_visibility.classification,
+                    "reason": terrain_visibility.reason,
+                    "required_coverage_distance_m": (
+                        terrain_visibility.required_coverage_distance_m
+                    ),
+                    "azimuth_footprint_half_width_deg": (
+                        terrain_visibility.azimuth_footprint_half_width_deg
+                    ),
+                    "disk_witness_samples": (
+                        terrain_visibility.disk_witness_samples
+                    ),
+                    "visible_margin_deg": terrain_visibility.visible_margin_deg,
+                    "obstructed_margin_deg": (
+                        terrain_visibility.obstructed_margin_deg
+                    ),
+                    "classification_basis": (
+                        terrain_visibility.classification_basis
+                    ),
+                    "physical_terrain_visibility_certified": False,
+                }
+
+            timeline.append(timeline_point)
+
+            if delta_step > t_end - current_t:
+                break
+            current_t += delta_step
+
+    except _SunCalculationResponse as response:
+        calculation_result = response.response
+    except Exception as exc:
+        if use_terrain_horizon:
+            calculation_result = {
+                "status": "CALCULATION_ERROR",
+                "error": (
+                    "SPICE or terrain-aware Sun calculation failed; no "
+                    "geometric-only fallback was produced."
+                ),
+                "details": {"code": "TERRAIN_SUN_CALCULATION_ERROR"},
+                "data": None,
+            }
+        else:
+            calculation_result = {
+                "status": "CALCULATION_ERROR",
+                "error": f"SPICE calculation error: {str(exc)}",
+                "data": None
+            }
+    finally:
+        try:
+            spice.kclear()
+        except Exception:
+            if calculation_result is None:
+                calculation_result = {
+                    "status": "CALCULATION_ERROR",
+                    "error": "SPICE kernel cleanup failed.",
+                    "details": {"code": "SPICE_CLEANUP_ERROR"},
+                    "data": None,
+                }
+
+    if calculation_result is not None:
+        return calculation_result
+
+    elevations = [pt["sun_elevation_deg"] for pt in timeline]
+    illuminated_count = sum(1 for pt in timeline if pt["is_geometrically_illuminated"])
+    total_steps = len(timeline)
+
+    summary = {
+        "total_timesteps": total_steps,
+        "mean_solar_elevation_deg": round(float(np.mean(elevations)), 4) if elevations else None,
+        "max_solar_elevation_deg": round(float(np.max(elevations)), 4) if elevations else None,
+        "min_solar_elevation_deg": round(float(np.min(elevations)), 4) if elevations else None,
+        "geometric_illumination_fraction": round(illuminated_count / total_steps, 4) if total_steps > 0 else 0.0,
+        "terrain_shadow_analysis": terrain_analysis_status,
+        "terrain_shadow_notes": terrain_note,
+        "classification_definition": "FULL/PARTIAL/DARK classifies geometric solar-disk elevation relative to the mean spherical horizon. It does not measure physical surface illumination area or solar power flux."
+    }
+    if terrain_profile is not None:
+        summary["terrain_horizon_profile"] = {
+            "site_elevation_m": terrain_profile.site_elevation_m,
+            "max_distance_m": terrain_profile.max_distance_m,
+            "radial_step_m": terrain_profile.radial_step_m,
+            "azimuth_step_deg": terrain_profile.azimuth_step_deg,
+            "ray_count": len(terrain_profile.rays),
+            "complete_ray_count": sum(
+                1 for ray in terrain_profile.rays if ray.valid and ray.complete
+            ),
+            "incomplete_ray_count": sum(
+                1 for ray in terrain_profile.rays if not ray.valid or not ray.complete
+            ),
+            "classification_basis": "SAMPLED_PIECEWISE_LINEAR_HORIZON",
+            "physical_terrain_visibility_certified": False,
+            "frame_validation_status": FRAME_VALIDATION_STATUS,
+            "scientific_note": (
+                "Terrain classifications describe only the sampled profile; "
+                "continuous terrain visibility is not certified, and MOON_ME "
+                "frame alignment remains pending kernel validation."
+            ),
+        }
+
+    return {
+        "status": "SUCCESS",
+        "site": {
+            "latitude_deg": latitude_deg,
+            "longitude_deg": norm_lon_deg,
+            "coordinate_system": COORDINATE_SYSTEM,
+            "longitude_convention": LONGITUDE_CONVENTION,
+            "radius_m": LUNAR_RADIUS_METRES,
+            "distance_units": DISTANCE_UNITS,
+            "elevation_units": ELEVATION_UNITS
+        },
+        "reference_frame": LUNAR_REFERENCE_FRAME,
+        "kernels_used": loaded_kernels,
+        "time_range": {
+            "start_time_utc": start_time_utc,
+            "end_time_utc": end_time_utc,
+            "step_hours": step_hours
+        },
+        "summary": summary,
+        "timeline": timeline
+    }

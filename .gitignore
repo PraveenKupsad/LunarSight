@@ -228,3 +228,15 @@ data/spice_kernels/*
 
 data/processed/*
 !data/processed/.gitkeep
+
+# Large scientific datasets and SPICE kernels
+*.tif
+*.tiff
+*.img
+*.jp2
+*.bsp
+*.bpc
+*.tls
+*.tpc
+*.tf
+*.bc
